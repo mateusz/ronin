@@ -93,11 +93,88 @@ func (r *Ronin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		session, _ = getPhpSession(sessionCookie.Value)
 	}
 
+	// Get user security group memberships.
 	if session != nil {
-		// extract loggedInAs and find member by Member.ID
-		fmt.Printf("%v", session["loggedInAs"])
+		if memberId, ok := session["loggedInAs"]; ok {
+		}
 	}
 
-	filePath := singleJoiningSlash(r.Config.AssetPath, strings.TrimLeft(req.URL.Path, "/cwp-installer-clean/assets"))
-	http.ServeFile(rw, req, filePath)
+	// Get the Filename as used in the DB.
+	relativePath := strings.TrimLeft(req.URL.Path, "/cwp-installer-clean")
+	// Get the real filesystem path.
+	filesystemPath := singleJoiningSlash(r.Config.AssetPath, strings.TrimLeft(relativePath, "/assets"))
+
+	// Get file security settings.
+	var id int
+	var parentId int
+	var canViewType string
+	err := r.DB.QueryRow("select ID, ParentID, CanViewType from File where Filename='?'", relativePath).Scan(&id, &parentId, &canViewType)
+	if err != nil {
+		// This file is not managed by SilverStripe.
+		rw.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	// Walk up the inheritance tree to find the first object with normal permission.
+	for canViewType == "Inherit" {
+		if parentId == 0 {
+			// We have reached the top and found we are inheriting all the way up. This means the file is open for viewing.
+			http.ServeFile(rw, req, filesystemPath)
+			return
+		}
+
+		err := r.DB.QueryRow("SELECT ID, ParentID, CanViewType FROM File where ID='?'", parentId).Scan(&id, &parentId, &canViewType)
+		if err != nil {
+			// Cannot establish the access permissions.
+			rw.WriteHeader(http.StatusNotFound)
+			return
+		}
+	}
+
+	// We have found non-inheriting node, we can now check the permissions.
+	if canViewType == "OnlyTheseUsers" {
+		// If we can walk the following graph, the member is allowed: Member(memberId) -> Grou_Members -> Group -> File_ViewerGroups -> File(id)
+		if memberId, ok := session["loggedInAs"]; ok {
+
+			var count int
+			err := r.DB.QueryRow(`
+					SELECT count(File.ID)
+					FROM Member
+					RIGHT JOIN Group_Members
+						ON Member.ID=Group_Members.MemberID
+					RIGHT JOIN Group
+						ON Group_Members.GroupID=Group.ID
+					RIGHT JOIN File_ViewerGroups
+						ON Group.ID=File_ViewerGroups.GroupID
+					WHERE
+						Member.ID='?'
+						AND
+						File_ViewerGroups.FileID='?'
+				`, memberId, id).Scan(&count)
+
+			if err != nil {
+				// Cannot establish the access permissions.
+				rw.WriteHeader(http.StatusNotFound)
+				return
+			}
+
+			// TODO find out if the graph was indeed walkable :-)
+			if graph was walkable {
+				// The member is allowed to access the file.
+				http.ServeFile(rw, req, filesystemPath)
+				return
+			}
+
+		}
+	} else if canViewType == "LoggedInUsers" {
+		if _, ok := session["loggedInAs"]; ok {
+			// Found an existing SilverStripe session, we can serve the file.
+			http.ServeFile(rw, req, filesystemPath)
+			return
+		}
+	}
+
+	// Default to file not found.
+	rw.WriteHeader(http.StatusNotFound)
+	return
 }
